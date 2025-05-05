@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+import cv2
+import numpy as np
+import pandas as pd
+import argparse
+from skimage.filters import threshold_otsu
+
+
+def detect_lanes(gray, num_lanes=0):
+    """
+    Project image vertically and detect lane boundaries by peaks in projection.
+    If num_lanes==0, auto-detect based on peaks.
+    """
+    # Sum pixel intensities along rows
+    proj = np.sum(gray, axis=0)
+    # Smooth projection
+    kernel = np.ones(50) / 50
+    smooth = np.convolve(proj, kernel, mode='same')
+    # Detect peaks
+    from scipy.signal import find_peaks
+    peaks, _ = find_peaks(smooth, distance=gray.shape[1]//(num_lanes+1))
+    if num_lanes and len(peaks) >= num_lanes:
+        peaks = peaks[:num_lanes]
+    return sorted(peaks)
+
+
+def detect_bands(lane_img):
+    # Threshold lane image
+    thresh = threshold_otsu(lane_img)
+    bw = lane_img < thresh
+    # Sum vertically
+    proj = np.sum(bw, axis=1)
+    # Find bands by peaks
+    from scipy.signal import find_peaks
+    peaks, _ = find_peaks(proj, distance=20, prominence=proj.max()*0.1)
+    return peaks
+
+
+def estimate_sizes(band_positions, ladder_positions, ladder_sizes):
+    # Fit linear model: log(size) vs position
+    log_sizes = np.log(ladder_sizes)
+    coeffs = np.polyfit(ladder_positions, log_sizes, 1)
+    predicted = np.exp(np.polyval(coeffs, band_positions))
+    return predicted
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--input', required=True)
+    p.add_argument('--ladder-lane', type=int, required=True)
+    p.add_argument('--ladder-sizes', required=True,
+                   help='Comma-separated sizes for ladder bands')
+    p.add_argument('--output-img', required=True)
+    p.add_argument('--output-csv', required=True)
+    args = p.parse_args()
+
+    # Load and preprocess
+    img = cv2.imread(args.input)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Detect lanes
+    lane_centers = detect_lanes(gray)
+
+    results = []
+    ladder_sizes = list(map(int, args.ladder_sizes.split(',')))
+    ladder_positions = []
+
+    # Process each lane
+    for i, x in enumerate(lane_centers):
+        # Extract lane window (± lane_width)
+        lane_width = int(0.4 * (lane_centers[1] - lane_centers[0])) if len(lane_centers)>1 else 50
+        x0, x1 = max(0, x-lane_width), min(gray.shape[1], x+lane_width)
+        lane_img = gray[:, x0:x1]
+        bands = detect_bands(lane_img)
+
+        if i == args.ladder_lane:
+            ladder_positions = bands
+
+        # Estimate sizes
+        sizes = []
+        if ladder_positions and i != args.ladder_lane:
+            sizes = estimate_sizes(bands, ladder_positions, ladder_sizes)
+
+        # Record results
+        for pos, size in zip(bands, sizes if sizes else ['NA']):
+            results.append({'lane': i, 'position': int(pos), 'size_bp': float(size) if size!='NA' else 'NA'})
+
+        # Draw bands on image
+        for pos in bands:
+            cv2.line(img, (x0, pos), (x1, pos), (0,255,0), 1)
+        cv2.line(img, (x, 0), (x, img.shape[0]), (255,0,0), 2)
+
+    # Save annotated image
+    cv2.imwrite(args.output_img, img)
+
+    # Save CSV
+    df = pd.DataFrame(results)
+    df.to_csv(args.output_csv, index=False)
+    print(f"Results written to {args.output_csv} and {args.output_img}")
+
+if __name__ == '__main__':
+    main()
